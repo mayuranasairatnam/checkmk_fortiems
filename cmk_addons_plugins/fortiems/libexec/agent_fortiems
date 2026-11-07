@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""
+FortiClient EMS special agent for Dedicated and Shared deployments.
+
+Local or RADIUS authentication establishes a cookie session for one run.
+Only monitoring fields are exported; full settings and session tokens stay local.
+"""
+import argparse
+import json
+from pathlib import Path
+import sys
+import time
+from urllib.parse import urlencode
+
+import requests
+
+
+class APIError(Exception):
+    """
+    A sanitized transport, authentication or API error.
+    """
+
+
+class Client:
+    """
+    HTTPS transport retaining EMS cookies and refreshing CSRF headers per request.
+
+    Input:
+        address, port, timeout and TLS verification settings.
+    Output:
+        Session client exposing sanitized API responses or APIError exceptions.
+    """
+    def __init__(self, address, port=443, timeout=30, verify=True):
+        """
+        Initialize the HTTPS session and validate the destination.
+
+        Input:
+            address: Host/IP; port: HTTPS port; timeout: Seconds; verify: TLS flag.
+        Output:
+            Initialized requests session with environment proxies disabled.
+        """
+        # The address is a host/IP, never a URL containing credentials or a path.
+        if any(char in address for char in '/@?#') or not address.strip():
+            raise APIError('Invalid EMS host address; supply a hostname or IP')
+        host = f'[{address}]' if ':' in address and not address.startswith('[') else address
+        # Match the browser/diagnostic origin: HTTPS omits its default port.
+        # Keep nonstandard ports in both request URLs and CSRF headers.
+        authority = host if port == 443 else f'{host}:{port}'
+        self.base_url = f'https://{authority}'
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.verify = verify
+        if not verify:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    def _send(self, method, path, payload, headers):
+        """
+        Retry transient reads/site switches, keeping authentication errors final.
+        """
+        attempts = 3 if method == 'GET' or path.endswith('/api/v1/session/update') else 1
+        endpoint = path.split('?', 1)[0]
+        for attempt in range(attempts):
+            try:
+                # Cookies can rotate even on a transient error response.
+                if 'x-csrftoken' in headers:
+                    token = self.session.cookies.get('csrftoken')
+                    if not token:
+                        raise APIError('Missing csrftoken')
+                    headers['x-csrftoken'] = token
+                response = self.session.request(
+                    method, self.base_url + path, json=payload, headers=headers,
+                    timeout=self.timeout, allow_redirects=False)
+            except requests.exceptions.SSLError:
+                raise APIError('TLS certificate verification or handshake failed') from None
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt + 1 == attempts:
+                    message = 'HTTPS/API timeout' if isinstance(exc, requests.exceptions.Timeout) else 'EMS unreachable or HTTPS connection failed'
+                    raise APIError(message) from None
+            except requests.exceptions.RequestException:
+                raise APIError('EMS unreachable or HTTPS connection failed') from None
+            else:
+                if response.status_code in (401, 403):
+                    raise APIError(
+                        f'HTTP {response.status_code} {method} {endpoint}: '
+                        'Authentication or API permission denied')
+                if 200 <= response.status_code < 300:
+                    return response
+                if response.status_code not in (429, 502, 503, 504) or attempt + 1 == attempts:
+                    raise APIError(f'HTTP {response.status_code} {method} {endpoint}')
+            time.sleep(0.5 * (attempt + 1))
+
+    def request(self, method, path, payload=None, *, login=False, call_type='2'):
+        """
+        Execute one bounded API request with the current session token.
+
+        Input:
+            method/path/payload: API request; login: Skip CSRF; call_type: Context.
+        Output:
+            Valid JSON envelope; raises sanitized APIError on failure.
+        """
+        headers = {'accept': 'application/json', 'referer': self.base_url + '/',
+                   'ems-call-type': call_type}
+        if method == 'POST':
+            headers['origin'] = self.base_url
+        if not login:
+            token = self.session.cookies.get('csrftoken')
+            if not token:
+                raise APIError('Missing csrftoken')
+            headers['x-csrftoken'] = token
+        response = self._send(method, path, payload, headers)
+        return self._decode_response(response)
+
+    @staticmethod
+    def _decode_response(response):
+        """
+        Validate an EMS/gateway JSON envelope without exposing error bodies.
+        """
+        try:
+            result = response.json()
+            json.dumps(result, allow_nan=False)
+        except ValueError:
+            raise APIError('Invalid JSON response') from None
+        if not isinstance(result, dict):
+            raise APIError('Invalid API response envelope')
+        # EMS uses result.retval == 1 to confirm success, including site switches.
+        outcome = result.get('result')
+        if isinstance(outcome, dict) and 'retval' in outcome and outcome['retval'] not in (1, '1'):
+            raise APIError('EMS API reported a failure (result.retval)')
+        # Never copy error bodies (which can contain credentials) into agent output.
+        if (result.get('success') is False or result.get('error')
+                or result.get('status') in ('error', 'failed', 'failure')
+                or result.get('code', 0) not in (0, '0', None)):
+            raise APIError('EMS API reported a failure')
+        return result
+
+    def login(self, user, password, site='default', auth_method='radius'):
+        """
+        Authenticate through the explicitly selected EMS login endpoint.
+
+        Input:
+            user/password: Runtime credentials; site: Login site, or None to omit it;
+            auth_method: radius or local. No automatic fallback is attempted.
+        Output:
+            None; retains cookies and requires a non-empty csrftoken.
+        """
+        endpoints = {'radius': '/api/v1/auth/radius', 'local': '/api/v1/auth/signin'}
+        if auth_method not in endpoints:
+            raise APIError('Unsupported authentication method')
+        payload = {'name': user, 'password': password}
+        if site is not None:
+            payload['site'] = site
+        if auth_method == 'local':
+            # Some EMS versions set a pre-login cookie; others set it at signin.
+            # The HTML response is intentionally not parsed as an API envelope.
+            self._send('GET', '/', None, {'accept': 'text/html',
+                                          'referer': self.base_url + '/', 'ems-call-type': '2'})
+        # The tested EMS accepts signin without a pre-login cookie. Use a CSRF
+        # header when available, and require the cookie only after successful login.
+        skip_csrf = auth_method != 'local' or not self.session.cookies.get('csrftoken')
+        self.request('POST', endpoints[auth_method], payload, login=skip_csrf)
+        if not self.session.cookies.get('csrftoken'):
+            raise APIError(f'Missing csrftoken after {auth_method} login')
+
+    def get(self, path, expected=dict, *, call_type='2'):
+        """
+        Retrieve and validate an endpoint's data container.
+
+        Input:
+            path: API path; expected: Container type; call_type: EMS context.
+        Output:
+            Data dictionary/list or APIError for missing/invalid data.
+        """
+        result = self.request('GET', path, call_type=call_type)
+        # EMS 7.4 reports an empty IDP inventory as a successful envelope
+        # without data. This exception is endpoint-specific and requires success.
+        outcome = result.get('result')
+        if (path == '/api/v1/idps/index' and expected is list and 'data' not in result
+                and isinstance(outcome, dict) and outcome.get('retval') in (1, '1')):
+            return []
+        if 'data' not in result or not isinstance(result['data'], expected):
+            actual = type(result['data']).__name__ if 'data' in result else 'missing'
+            raise APIError(f'Missing or invalid API data (expected {expected.__name__}, received {actual})')
+        return result['data']
+
+    def tenants(self):
+        """
+        Discover customer sites without imposing a customer-name pattern.
+
+        Input:
+            Current authenticated management session.
+        Output:
+            Unique site names including default, excluding only global management.
+        """
+        # The supplied shared example requires management context for site discovery.
+        sites = self.get('/api/v1/sites/index', list, call_type='1')
+        names = []
+        for site in sites:
+            if not isinstance(site, dict) or not isinstance(site.get('name'), str) or not site['name'].strip():
+                raise APIError('Invalid site entry')
+            if site['name'].lower() != 'global':
+                names.append(site['name'])
+        if len(names) != len(set(names)):
+            raise APIError('Duplicate site names')
+        return sorted(names)
+
+    def switch(self, site):
+        """
+        Change session context before collecting a shared tenant.
+
+        Input:
+            site: Exact EMS tenant name.
+        Output:
+            None; raises APIError when switching fails.
+        """
+        self.request('POST', '/api/v1/session/update', {'site': site})
+
+
+class CloudClient(Client):
+    """
+    FortiClient Cloud gateway using Access Key login without tenant selection.
+    """
+
+    PREFIX = '/fct/api/public/v1'
+
+    def __init__(self, timeout=30, verify=True):
+        super().__init__('forticlient.forticloud.com', timeout=timeout, verify=verify)
+        self._cloud_session_id = None
+
+    def login(self, user, password, site=None, auth_method='cloud'):
+        if auth_method != 'cloud':
+            raise APIError('Cloud EMS requires Cloud Access Key authentication')
+        if site not in (None, 'default'):
+            raise APIError('Cloud EMS does not support site selection')
+        response = self._send('POST', self.PREFIX + '/ems_api_cloud/login/',
+                              {'access_key': password, 'account_email': user},
+                              {'accept': 'application/json'})
+        result = self._decode_response(response)
+        session_id = result.get('session_id')
+        if result.get('result') != 'login' or not isinstance(session_id, str) or not session_id.strip():
+            raise APIError('Cloud login did not return a valid session ID')
+        self._cloud_session_id = session_id
+
+    def tenants(self):
+        raise APIError('Cloud EMS does not support site discovery')
+
+    def switch(self, site):
+        raise APIError('Cloud EMS does not support site switching')
+
+    def request(self, method, path, payload=None, *, login=False, call_type='2'):
+        if not self._cloud_session_id:
+            raise APIError('Missing Cloud session ID')
+        if not path.startswith('/api/v1/'):
+            raise APIError('Invalid EMS API path')
+        headers = {'accept': 'application/json', 'Authorization': self._cloud_session_id,
+                   'Ems-Api-Header-Content-Type': 'application/json'}
+        response = self._send(method, self.PREFIX + '/ems_api' + path, payload, headers)
+        return self._decode_response(response)
+
+    def logout(self):
+        if self._cloud_session_id is None:
+            return
+        session_id = self._cloud_session_id
+        try:
+            self._send('POST', self.PREFIX + '/ems_api_cloud/logout/', None,
+                       {'Authorization': session_id, 'accept': 'application/json'})
+        finally:
+            self._cloud_session_id = None
+
+
+ENDPOINTS = {
+    'info': ('/api/v1/system/info?is_basic=true', dict),
+    'settings': ('/api/v1/settings/server/get', dict),
+    'license': ('/api/v1/license/get', dict),
+    'certificates': ('/api/v1/server_certificates/index', list),
+    'idps': ('/api/v1/idps/index', list),
+    'windows': ('/api/v1/endpoints/fctversionwindows/donut', list),
+    'macos': ('/api/v1/endpoints/fctversionmac/donut', list),
+    'webfilter': ('/api/v1/profiles/webfilter/index', dict),
+}
+
+
+FIELDS = {
+    'info': {'name': None, 'version': None, 'system_time': None},
+    'settings': {'auto_upgrade_enabled': None, 'fct_repackager_upload_region': None},
+    'license': {'sn': None, 'vdom_seats': {'ztna': None, 'epp': None, 'sase': None},
+                'used': {'ztna': None, 'epp': None, 'sase': None},
+                'licenses': [{'type': None, 'start_date': None, 'expiry_date': None}]},
+    'certificates': [{'name': None, 'expiry_date': None, 'assigned_to': None}],
+    'idps': [{'id': None, 'guid': None, 'name': None, 'total_devices': None, 'total_users': None,
+              'connection_info': {'alias': None, 'conn_online': None},
+              'domain_info': {'name': None, 'guid': None}, 'group_info': {'path': None},
+              'status': {'online': None, 'sync_progress': None, 'last_error': None,
+                         'last_success_enumerated': None}}],
+    'windows': [{'name': None, 'value': None}],
+    'macos': [{'name': None, 'value': None}],
+    'consts': {'System': {'VERSION': None, 'VERSION_FULL': None}},
+    'webfilter': {
+        'local': [{'id': None, 'name': None}], 'chrome': [{'id': None, 'name': None}],
+        'imported': [{'fp_name': None, 'host': None,
+                      'task': {'enabled': None, 'last_run_time': None,
+                               'last_successful_run_time': None, 'last_error': None},
+                      'profiles': [{'profile_id': None, 'profile_name': None}]}],
+    },
+}
+
+
+def webfilter_profile_ids(index):
+    """
+    Validate the webfilter index and collect local, Chrome and imported IDs.
+
+    Input:
+        index: Projected data from the webfilter profile index endpoint.
+    Output:
+        Sorted unique numeric IDs; raises APIError for malformed index data.
+    """
+    if not isinstance(index, dict) or not any(key in index for key in ('local', 'chrome', 'imported')):
+        raise APIError('Invalid webfilter profile index')
+    ids = set()
+    def add(entries, key):
+        """
+        Read IDs from one index bucket without silently discarding bad rows.
+
+        Input:
+            entries: Profile list; key: Identifier field.
+        Output:
+            Updates the validated ID set or raises APIError.
+        """
+        if not isinstance(entries, list):
+            raise APIError('Invalid webfilter profile list')
+        for entry in entries:
+            value = entry.get(key) if isinstance(entry, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).isdigit():
+                raise APIError('Invalid webfilter profile ID')
+            ids.add(int(value))
+    for key in ('local', 'chrome'):
+        add(index.get(key, []), 'id')
+    imports = index.get('imported', [])
+    if not isinstance(imports, list):
+        raise APIError('Invalid imported webfilter list')
+    for firewall in imports:
+        if not isinstance(firewall, dict):
+            raise APIError('Invalid imported firewall')
+        add(firewall.get('profiles', []), 'profile_id')
+    return sorted(ids)
+
+
+def webfilter_profile(data, profile_id):
+    """
+    Reduce a profile response to monitoring settings and list counts.
+
+    Input:
+        data: Profile endpoint data; profile_id: Requested numeric ID.
+    Output:
+        Safe summary excluding URL contents and other profile secrets.
+    """
+    config = data.get('json')
+    settings = config.get('webfilter') if isinstance(config, dict) else None
+    if not isinstance(settings, dict):
+        raise APIError('Missing webfilter profile settings')
+    guard = settings.get('fortiguard')
+    result = project(data, {'name': None, 'update_time': None, 'is_default': None,
+                            'is_chromebook': None, 'is_imported': None})
+    result.update({'id': profile_id, 'enabled': project(settings.get('enabled'), None),
+                   'fortiguard_enabled': project(guard.get('enabled'), None) if isinstance(guard, dict) else None,
+                   'categories': len(settings['categories']) if isinstance(settings.get('categories'), list) else None,
+                   'urls': len(settings['urls']) if isinstance(settings.get('urls'), list) else None})
+    return result
+
+
+def project(value, fields):
+    """
+    Keep monitoring fields while excluding credentials and unrelated settings.
+
+    Input:
+        value: API data; fields: Nested allowlist, with None indicating a leaf.
+    Output:
+        Reduced data retaining missing/invalid fields for explicit check errors.
+    """
+    if isinstance(fields, dict) and isinstance(value, dict):
+        return {key: project(value[key], spec) for key, spec in fields.items() if key in value}
+    if isinstance(fields, list) and isinstance(value, list):
+        return [project(entry, fields[0]) for entry in value]
+    if fields is None and isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    if fields is None and isinstance(value, (dict, list)):
+        return None
+    if fields is not None:
+        return None
+    return value
+
+
+def collect_record(client, tenant, keys, *, constants=False, settings_fields=None):
+    """
+    Collect a global/dedicated record or the site-scoped endpoint subset.
+    """
+    for key in keys:
+        path, expected = ENDPOINTS[key]
+        try:
+            fields = settings_fields if key == 'settings' and settings_fields is not None else FIELDS[key]
+            data = client.get(path, expected)
+            if key == 'license' and isinstance(client, CloudClient) and isinstance(data, dict):
+                # Cloud capacity is instance-wide; vdom_seats is an On-Prem site field.
+                data = {**data, 'vdom_seats': data.get('seats')}
+            tenant['data'][key] = project(data, fields)
+        except APIError as exc:
+            tenant['errors'].append(f'{key}: {exc}')
+    if 'webfilter' in tenant['data']:
+        try:
+            ids = webfilter_profile_ids(tenant['data']['webfilter'])
+        except APIError as exc:
+            tenant['errors'].append(f'webfilter: {exc}')
+        else:
+            profiles = tenant['data']['webfilter_profiles'] = []
+            for profile_id in ids:
+                try:
+                    data = client.get(f'/api/v1/profiles/webfilter/{profile_id}/get')
+                    profiles.append(webfilter_profile(data, profile_id))
+                except APIError as exc:
+                    profiles.append({'id': profile_id, 'error': str(exc)})
+                    tenant['errors'].append(f'webfilter profile {profile_id}: {exc}')
+    if not constants:
+        return
+    # VERSION_FULL is in consts in the supplied EMS examples.
+    try:
+        path = '/api/v1/system/consts/get'
+        if isinstance(client, CloudClient):
+            # Cloud info has no system_time. Send both update parameters using
+            # an initial sync baseline, never a copied browser timestamp.
+            timestamp = '1970-01-01T00:00:00'
+        else:
+            system_time = tenant['data'].get('info', {}).get('system_time')
+            if not isinstance(system_time, str) or not system_time:
+                raise APIError('system_time missing for constants query')
+            timestamp = system_time.replace(' ', 'T')
+        query = urlencode({'system_update_time': timestamp, 'vdom_update_time': timestamp})
+        path += '?' + query
+        tenant['data']['consts'] = project(client.get(path), FIELDS['consts'])
+    except APIError as exc:
+        tenant['errors'].append(f'consts: {exc}')
+
+
+def collect(client, user, password, site='default', shared=False, selected=(), *, auth_method='radius'):
+    """
+    Collect each site sequentially and preserve errors independently of measurements.
+
+    Input:
+        client: EMS client; user/password: Runtime credentials; site: Dedicated login site;
+        shared: Discover tenants; selected: Optional exact tenant allowlist;
+        auth_method: Explicit local or RADIUS authentication method.
+    Output:
+        JSON-serializable section; closes local session resources in every case.
+    """
+    result = {'schema': 1, 'shared': shared, 'errors': [], 'tenants': {}}
+    if isinstance(client, CloudClient):
+        result['cloud'] = True
+    stage = f'{auth_method} login'
+    try:
+        if isinstance(client, CloudClient) and (shared or selected or site != 'default'):
+            raise APIError('Cloud EMS does not support tenants or site selection')
+        # Match the supplied Shared workflow: authenticate without binding the
+        # session to default, then discover sites and switch explicitly.
+        client.login(user, password, None if shared else site, auth_method=auth_method)
+        stage = 'Site discovery'
+        sites = client.tenants() if shared else [site]
+        if shared and not sites:
+            result['errors'].append(
+                'No monitoring sites discovered (global excluded); '
+                'check Shared deployment mode and account site access')
+        if shared and selected:
+            missing = set(selected) - set(sites)
+            if missing:
+                result['errors'].append(
+                    'Configured tenants missing or inaccessible: ' + ', '.join(sorted(missing))
+                    + '; discovered customer sites (case-sensitive): '
+                    + (', '.join(sites) if sites else 'none'))
+            sites = [name for name in sites if name in selected]
+        if shared:
+            global_record = result['global'] = {'errors': [], 'data': {}}
+            try:
+                client.switch('global')
+            except APIError as exc:
+                global_record['errors'].append(f'Global context switch: {exc}')
+            else:
+                collect_record(client, global_record, ('info', 'settings', 'license', 'certificates'),
+                               constants=True, settings_fields={'auto_upgrade_enabled': None})
+        for name in sites:
+            tenant = {'errors': [], 'data': {}}
+            result['tenants'][name] = tenant
+            if shared:
+                try:
+                    client.switch(name)
+                except APIError as exc:
+                    tenant['errors'].append(f'Tenant switch: {exc}')
+                    continue  # Never collect under the preceding tenant's session context.
+            keys = ('settings', 'license', 'idps', 'windows', 'macos', 'webfilter') if shared else ENDPOINTS
+            if isinstance(client, CloudClient):
+                keys = [key for key in keys if key != 'certificates']
+            collect_record(client, tenant, keys, constants=not shared,
+                           settings_fields={'fct_repackager_upload_region': None} if shared else None)
+    except APIError as exc:
+        result['errors'].append(f'{stage}: {exc}')
+    finally:
+        try:
+            if isinstance(client, CloudClient):
+                client.logout()
+        except APIError as exc:
+            result['errors'].append(f'Cloud logout: {exc}')
+        finally:
+            client.session.close()
+    return result
+
+
+def password_from_reference(reference):
+    """
+    Resolve Checkmk's secret reference without accepting plaintext argv passwords.
+
+    Input:
+        reference: ID:FILE reference generated by Checkmk.
+    Output:
+        Non-empty secret from the site password store, or a lookup exception.
+    """
+    ident, separator, filename = reference.partition(':/')
+    if not separator or not ident or not filename:
+        raise ValueError('Invalid password reference')
+    from cmk.utils.password_store import lookup
+    value = lookup(Path('/' + filename), ident)
+    if not isinstance(value, str) or not value:
+        raise ValueError('Empty password')
+    return value
+
+
+def main(argv=None):
+    """
+    Parse runtime options, resolve credentials and print the agent JSON section.
+
+    Input:
+        argv: Optional argument sequence; otherwise the process arguments.
+    Output:
+        Exit status 0 after writing monitoring data or a collection error section.
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--address')
+    parser.add_argument('--user')
+    parser.add_argument('--cloud', action='store_true', help='Use the FortiClient Cloud API gateway')
+    parser.add_argument('--account-email')
+    secret = parser.add_mutually_exclusive_group(required=True)
+    secret.add_argument('--password-id')
+    secret.add_argument('--password-stdin', action='store_true')
+    secret.add_argument('--access-key-id')
+    secret.add_argument('--access-key-stdin', action='store_true')
+    parser.add_argument('--port', type=int, default=443)
+    parser.add_argument('--timeout', type=int, default=30)
+    parser.add_argument('--site', default='default',
+                        help='Dedicated login site; ignored in Shared mode')
+    parser.add_argument('--auth-method', choices=('radius', 'local'), default='radius',
+                        help='Authentication method; defaults to radius for existing rules')
+    parser.add_argument('--shared', action='store_true')
+    parser.add_argument('--tenant', action='append', default=[])
+    parser.add_argument('--no-cert-check', action='store_true')
+    args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535 or args.timeout <= 0 or not args.site.strip():
+        parser.error('Invalid port, timeout or site')
+    if args.cloud:
+        if args.shared or args.tenant or args.site != 'default':
+            parser.error('Cloud EMS does not support --shared, --tenant or site selection')
+        if not args.account_email or not (args.access_key_id or args.access_key_stdin):
+            parser.error('--cloud requires --account-email and an access key reference or stdin')
+    elif not args.address or not args.user or not (args.password_id or args.password_stdin):
+        parser.error('On-prem requires --address, --user and a password reference or stdin')
+    if args.tenant and not args.shared:
+        parser.error('--tenant requires --shared')
+    try:
+        reference = args.access_key_id if args.cloud else args.password_id
+        password = (password_from_reference(reference) if reference
+                    else sys.stdin.readline().rstrip('\r\n'))
+        if not password:
+            raise ValueError('Empty password')
+    except (ImportError, OSError, ValueError, KeyError):
+        result = {'schema': 1, 'shared': args.shared, 'errors': ['Cannot read Checkmk credential; save rule and activate changes'], 'tenants': {}}
+    else:
+        try:
+            client = (CloudClient(args.timeout, not args.no_cert_check) if args.cloud
+                      else Client(args.address, args.port, args.timeout, not args.no_cert_check))
+            result = collect(client, args.account_email if args.cloud else args.user,
+                             password, args.site, args.shared, args.tenant,
+                             auth_method='cloud' if args.cloud else args.auth_method)
+        except APIError as exc:
+            result = {'schema': 1, 'shared': args.shared, 'errors': [str(exc)], 'tenants': {}}
+    print('<<<fortiems:sep(0)>>>')
+    print(json.dumps(result, ensure_ascii=True, allow_nan=False))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
